@@ -31,15 +31,18 @@ NS_LOG_COMPONENT_DEFINE("Fase401");
 // ---------------------------
 // Estructuras de resultados
 // ---------------------------
-struct ResultadosEscenario
-{
-  double delayMedioSeg      = 0.0;
-  double jitterMedioSeg     = 0.0;
-  double pdr                = 0.0;
-  double throughputMbps     = 0.0;
-  uint32_t paquetesPerdidos = 0;   // drops de QueueDisc
+struct ResultadosFlujo {
+    double delayMedio = 0;
+    double jitterMedio = 0;
+    double pdr = 0;
+    double throughput = 0;
 };
 
+struct ResultadosEscenario {
+    ResultadosFlujo cloud; // Datos del puerto 5000
+    ResultadosFlujo edge;  // Datos del puerto 5001
+    uint32_t dropsTotales = 0;
+};
 // ---------------------------
 // Header simple: seq + timestamp
 // ---------------------------
@@ -118,107 +121,86 @@ private:
 // ---------------------------
 // Observador QoS (sink): delay/jitter/PDR/throughput
 // ---------------------------
-class ObservadorQos
-{
+class ObservadorQos {
 public:
-  explicit ObservadorQos(Time tInicio)
-    : m_tInicio(tInicio)
-  {}
+    // Estructura interna para separar métricas por puerto (Servicio)
+    struct Metrics {
+        uint64_t rxPackets = 0;
+        uint64_t rxBytes = 0;
+        double sumDelay = 0;
+        double lastDelay = 0;
+        double sumJitter = 0;
+        Time firstRxTime = Seconds(0);
+        Time lastRxTime = Seconds(0);
+        bool hasFirstRx = false;
+        bool hasLastDelay = false;
+    };
 
-  void Rx(Ptr<Socket> sock)
-  {
-    Ptr<Packet> p;
-    Address from;
-    while ((p = sock->RecvFrom(from)))
-      {
-        if (Simulator::Now() < m_tInicio)
-          continue;
+    explicit ObservadorQos(Time tInicio) : m_tInicio(tInicio) {}
 
-        // Extraer header seq+ts
-        AppSeqTsHeader h;
-        if (p->GetSize() < h.GetSerializedSize())
-          continue;
+    // El Callback de recepción ahora identifica el flujo por el puerto local del socket
+    void Rx(Ptr<Socket> sock) {
+        Ptr<Packet> p;
+        Address from;
+        while ((p = sock->RecvFrom(from))) {
+            if (Simulator::Now() < m_tInicio) continue;
 
-        p->RemoveHeader(h);
+            // Extraemos cabecera personalizada para latencia E2E[cite: 4]
+            AppSeqTsHeader h;
+            if (p->GetSize() < h.GetSerializedSize()) continue;
+            p->RemoveHeader(h);
 
-        Time tTx = h.GetTs();
-        Time now = Simulator::Now();
-        double delay = (now - tTx).GetSeconds();
+            // DETECCIÓN DE SERVICIO: Obtenemos el puerto para saber si es Cloud (5000) o Edge (5001)
+            InetSocketAddress localAddr;
+            sock->GetSockName(localAddr); 
+            uint16_t port = localAddr.GetPort();
 
-        m_rxPackets++;
-        m_rxBytes += p->GetSize(); // payload restante (sin el header)
-        m_sumDelay += delay;
+            double delay = (Simulator::Now() - h.GetTs()).GetSeconds();
+            UpdateFlowMetrics(port, delay, p->GetSize());
+        }
+    }
 
-        if (m_hasLastDelay)
-          m_sumJitter += std::fabs(delay - m_lastDelay);
-        else
-          m_hasLastDelay = true;
+    // Devuelve los resultados filtrados por puerto
+    ResultadosEscenario GetStats(uint16_t port, uint64_t txPackets) {
+        ResultadosEscenario res;
+        if (m_flowStats.find(port) == m_flowStats.end()) return res;
 
-        m_lastDelay = delay;
-
-        NS_LOG_DEBUG("[RX] Paquete seq=" << h.GetSeq() << " delay=" << delay << "s");
-
-        if (!m_hasFirstRx)
-          {
-            m_hasFirstRx = true;
-            m_firstRxTime = now;
-          }
-        m_lastRxTime = now;
-      }
-  }
-
-  void SetTxTotals(uint64_t txPkts, uint64_t txBytes)
-  {
-    m_txPackets = txPkts;
-    m_txBytes   = txBytes;
-  }
-
-  ResultadosEscenario GetResultados(uint32_t drops) const
-  {
-    ResultadosEscenario r;
-    r.paquetesPerdidos = drops;
-
-    if (m_txPackets == 0) return r;
-
-    if (m_rxPackets > 0)
-      {
-        r.delayMedioSeg = m_sumDelay / (double)m_rxPackets;
-        if (m_rxPackets > 1)
-          r.jitterMedioSeg = m_sumJitter / (double)(m_rxPackets - 1);
-      }
-
-    r.pdr = (double)m_rxPackets / (double)m_txPackets;
-
-    if (m_hasFirstRx && m_lastRxTime > m_firstRxTime)
-      {
-        double dur = (m_lastRxTime - m_firstRxTime).GetSeconds();
-        r.throughputMbps = (m_rxBytes * 8.0) / (dur * 1e6);
-      }
-
-    return r;
-  }
+        Metrics &m = m_flowStats[port];
+        if (m.rxPackets > 0) {
+            res.delayMedioSeg = m.sumDelay / (double)m.rxPackets;
+            res.jitterMedioSeg = m.sumJitter / (double)(m.rxPackets - 1);
+            res.pdr = (double)m.rxPackets / (double)txPackets;
+            
+            double duracion = (m.lastRxTime - m.firstRxTime).GetSeconds();
+            if (duracion > 0) 
+                res.throughputMbps = (m.rxBytes * 8.0) / (duracion * 1e6);
+        }
+        return res;
+    }
 
 private:
-  Time m_tInicio;
+    Time m_tInicio;
+    std::map<uint16_t, Metrics> m_flowStats; // Almacén de métricas por puerto
 
-  // RX stats
-  uint64_t m_rxPackets = 0;
-  uint64_t m_rxBytes   = 0;
+    void UpdateFlowMetrics(uint16_t port, double delay, uint32_t size) {
+        Metrics &m = m_flowStats[port];
+        m.rxPackets++;
+        m.rxBytes += size;
+        m.sumDelay += delay;
 
-  // TX totals (inyectados desde el emisor)
-  uint64_t m_txPackets = 0;
-  uint64_t m_txBytes   = 0;
+        if (m.hasLastDelay) {
+            m.sumJitter += std::fabs(delay - m.lastDelay);
+        }
+        m.lastDelay = delay;
+        m.hasLastDelay = true;
 
-  double m_sumDelay  = 0.0;
-  double m_sumJitter = 0.0;
-  double m_lastDelay = 0.0;
-  bool   m_hasLastDelay = false;
-
-  bool m_hasFirstRx = false;
-  Time m_firstRxTime;
-  Time m_lastRxTime;
+        if (!m.hasFirstRx) {
+            m.hasFirstRx = true;
+            m.firstRxTime = Simulator::Now();
+        }
+        m.lastRxTime = Simulator::Now();
+    }
 };
-
 // ---------------------------
 // Aplicación emisor (una instancia = un “vehículo”)
 // ---------------------------
@@ -299,141 +281,127 @@ private:
 // Ejecuta un escenario (una capacidad concreta)
 // ---------------------------
 static ResultadosEscenario
-EjecutarEscenario(double tasaBackhaulMbps,
+EjecutarEscenario(double tasaBackhaulMbps, 
                   uint32_t nVehiculos,
                   uint32_t tamPaqueteBytes,
                   Time periodoEnvio,
                   Time duracionSim,
                   Time tiempoTransitorio,
-                  Time backhaulDelay,
                   uint32_t runId)
 {
-  NS_LOG_FUNCTION(tasaBackhaulMbps << nVehiculos << tamPaqueteBytes << periodoEnvio << duracionSim);
+  NS_LOG_FUNCTION(tasaBackhaulMbps << nVehiculos);
 
-  // Para réplicas independientes (solo afecta a RNG de desincronización)
-  RngSeedManager::SetRun(runId);
+  // 1. CONFIGURACIÓN DE SEMILLAS Y RÉPLICAS (Estadística PSR)
+  RngSeedManager::SetRun(runId); 
 
-  // Nodos: RSU (emisor agregado) + Central (servidor)
+  // 2. CREACIÓN DE INFRAESTRUCTURA (Jerarquía MEC)
   Ptr<Node> rsu = CreateObject<Node>();
-  Ptr<Node> central = CreateObject<Node>();
-  NodeContainer nodes;
-  nodes.Add(rsu);
-  nodes.Add(central);
+  Ptr<Node> edgeServer = CreateObject<Node>();  // Servidor MEC local[cite: 1]
+  Ptr<Node> cloudServer = CreateObject<Node>(); // Servidor Cloud remoto
+  
+  NodeContainer carNodes;
+  carNodes.Create(nVehiculos);
 
   InternetStackHelper stack;
-  stack.SetIpv6StackInstall(false);
-  stack.Install(nodes);
+  stack.InstallAll(NodeContainer(carNodes, rsu, edgeServer, cloudServer));
 
+  // 3. ENLACES Y TOPOLOGÍA
+  // Enlace A: RSU a Servidor Edge (LAN LAN de alta velocidad)[cite: 1]
+  CsmaHelper csmaEdge;
+  csmaEdge.SetChannelAttribute("DataRate", StringValue("1Gbps"));
+  csmaEdge.SetChannelAttribute("Delay", TimeValue(MicroSeconds(10)));
+  NetDeviceContainer edgeDevs = csmaEdge.Install(NodeContainer(rsu, edgeServer));
 
+  // Enlace B: RSU a Servidor Cloud (WAN Lenta - El Cuello de Botella)
+  PointToPointHelper pppCloud;
+  pppEdge.SetDeviceAttribute("DataRate", DataRateValue(DataRate(std::to_string(tasaBackhaulMbps) + "Mbps")));
+  pppEdge.SetChannelAttribute("Delay", TimeValue(MilliSeconds(20)));
+  NetDeviceContainer cloudDevs = pppCloud.Install(NodeContainer(rsu, cloudServer));
 
-  // Enlace backhaul simplificado (PointToPointHelper)
-  PointToPointHelper ppp;
+  // Enlace C: Vehículos a RSU (Acceso vehicular simplificado)[cite: 1]
+  CsmaHelper v2rsu;
+  v2rsu.SetChannelAttribute("DataRate", StringValue("100Mbps"));
+  v2rsu.SetChannelAttribute("Delay", MilliSeconds(1));
   
-  // En PPP, la velocidad (DataRate) es un atributo del DISPOSITIVO (Device), no del canal
-  ppp.SetDeviceAttribute("DataRate", 
-                         DataRateValue(DataRate(std::to_string(tasaBackhaulMbps) + "Mbps")));
+  // 4. DIRECCIONAMIENTO IP (3 Subredes)
+  Ipv4AddressHelper address;
+  address.SetBase("10.1.1.0", "255.255.255.0"); // Subred Edge
+  Ipv4InterfaceContainer edgeIfs = address.Assign(edgeDevs);
   
-  // En PPP, el retardo (Delay) es un atributo del CANAL (Channel)
-  ppp.SetChannelAttribute("Delay", TimeValue(backhaulDelay));
+  address.SetBase("10.1.2.0", "255.255.255.0"); // Subred Cloud
+  Ipv4InterfaceContainer cloudIfs = address.Assign(cloudDevs);
 
-  // Instalamos los dispositivos
-  NetDeviceContainer devs = ppp.Install(nodes);
-
-  // QueueDisc en el netdevice de la RSU (devs.Get(0))
-  TrafficControlHelper tch;
-  tch.SetRootQueueDisc("ns3::FqCoDelQueueDisc");
-  QueueDiscContainer qdiscs = tch.Install(devs.Get(0));
-  Ptr<QueueDisc> cola = qdiscs.Get(0);
-  ObservadorCola obsCola(cola);
-
-  // IPv4
-  Ipv4AddressHelper addr("10.1.1.0", "255.255.255.0");
-  Ipv4InterfaceContainer ifs = addr.Assign(devs);
   Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 
-  const uint16_t puerto = 5000;
-  Ipv4Address ipCentral = ifs.GetAddress(1); // central es nodo 1
-
-  // Socket RX en Central
-  Ptr<Socket> rxSock = Socket::CreateSocket(central, UdpSocketFactory::GetTypeId());
-  rxSock->Bind(InetSocketAddress(Ipv4Address::GetAny(), puerto));
-
-  ObservadorQos obsQos(tiempoTransitorio);
-  rxSock->SetRecvCallback(MakeCallback(&ObservadorQos::Rx, &obsQos));
-
-// 1. Configuramos el modelo de ráfagas (OnOffApplication)
-  OnOffHelper emergencyTraffic ("ns3::UdpSocketFactory", 
-                             Address (InetSocketAddress (ifs.GetAddress(1), 5001)) // Puerto 5001 para Alertas
-
-// Seteamos la tasa de la ráfaga: ej. 2 Mbps durante el evento de emergencia
-  emergencyTraffic.SetAttribute ("DataRate", StringValue ("2Mbps"));
-  emergencyTraffic.SetAttribute ("PacketSize", UintegerValue (1024));
-
-// 2. Modelo Estocástico (Argumento de Teletráfico)
-// Usamos Pareto para el tiempo 'On' (ráfaga densa) y Constant para el 'Off'
-  emergencyTraffic.SetOnTime ("ns3::ParetoRandomVariable", "Mean", DoubleValue (1.0), "Shape", DoubleValue (1.5));
-  emergencyTraffic.SetOffTime ("ns3::ConstantRandomVariable", "Value", DoubleValue (30.0)); // Evento raro
-
-  // N “vehículos” = N apps emisoras en RSU
+  // 5. VARIABLES ALEATORIAS PARA TRÁFICO ESTOCÁSTICO
   Ptr<UniformRandomVariable> u = CreateObject<UniformRandomVariable>();
   u->SetAttribute("Min", DoubleValue(0.0));
-  u->SetAttribute("Max", DoubleValue(periodoEnvio.GetSeconds())); // desincronización en [0, T]
+  u->SetAttribute("Max", DoubleValue(periodoEnvio.GetSeconds())); 
 
-  std::vector< Ptr<TelemSender> > senders;
-  senders.reserve(nVehiculos);
+  // 6. INSTALACIÓN DE APLICACIONES EN CADA VEHÍCULO
+  uint16_t portCloud = 5000;
+  uint16_t portEdge = 5001;
 
-  ApplicationContainer appsEmergencia;
-
-  for (uint32_t i = 0; i < nVehiculos; ++i)
-    {
-      Ptr<TelemSender> app = CreateObject<TelemSender>();
-      app->Setup(ipCentral, puerto, tamPaqueteBytes, periodoEnvio);
-      rsu->AddApplication(app);
-
-      Time t0 = Seconds(u->GetValue());
-      app->SetStartTime(t0);
-      app->SetStopTime(duracionSim);
-
-      senders.push_back(app);
-
+  for (uint32_t i = 0; i < nVehiculos; ++i) {
+      // Conectar coche i a la RSU
+      v2rsu.Install(NodeContainer(carNodes.Get(i), rsu));
       
-      // Instalamos una instancia de ráfagas por cada vehículo simulado
-      ApplicationContainer unaApp = emergencyTraffic.Install(rsu); 
-      unaApp.Start(t0); // Usamos el mismo desincronizador para que no empiecen todos a la vez
-      unaApp.Stop(duracionSim);
-      appsEmergencia.Add(unaApp);
-    }
+      // A) FLUJO 1: Telemetría Base al CLOUD (CBR)[cite: 4, 7]
+      Ptr<TelemSender> baseApp = CreateObject<TelemSender>();
+      baseApp->Setup(cloudIfs.GetAddress(1), portCloud, tamPaqueteBytes, periodoEnvio);
+      carNodes.Get(i)->AddApplication(baseApp);
+      baseApp->SetStartTime(Seconds(u->GetValue()));
+      baseApp->SetStopTime(duracionSim);
 
-    // Receptor para las ráfagas de emergencia (Puerto 5001)
-  PacketSinkHelper sink ("ns3::UdpSocketFactory", 
-                      InetSocketAddress (Ipv4Address::GetAny (), 5001));
-  ApplicationContainer sinkApp = sink.Install (central);
-  sinkApp.Start (Seconds (0.0));
-  sinkApp.Stop (duracionSim + Seconds (1.0));
+      // B) FLUJO 2: Emergencia al EDGE (Ráfagas On-Off Pareto)[cite: 7]
+      OnOffHelper burstApp("ns3::UdpSocketFactory", 
+                           Address(InetSocketAddress(edgeIfs.GetAddress(1), portEdge)));
+      burstApp.SetAttribute("DataRate", StringValue("2Mbps"));
+      // Pareto para el tiempo ON (Cola pesada = ráfagas densas aleatorias)[cite: 7, 8]
+      burstApp.SetOnTime("ns3::ParetoRandomVariable", "Mean", DoubleValue(1.0), "Shape", DoubleValue(1.5));
+      burstApp.SetOffTime("ns3::ExponentialRandomVariable", "Mean", DoubleValue(10.0));
+      
+      ApplicationContainer burstApps = burstApp.Install(carNodes.Get (i));
+      burstApps.Start(Seconds(u->GetValue() + 2.0)); 
+      burstApps.Stop(duracionSim);
+  }
 
+// --- FINAL DE LA FUNCIÓN EjecutarEscenario ---
+
+  // 7. RECEPCIÓN Y MONITORIZACIÓN (Configuración de Sinks)
+  // Socket para el Servidor CLOUD (Puerto 5000)
+  Ptr<Socket> cloudSink = Socket::CreateSocket(cloudServer, UdpSocketFactory::GetTypeId());
+  cloudSink->Bind(InetSocketAddress(Ipv4Address::GetAny(), portCloud));
+  cloudSink->SetRecvCallback(MakeCallback(&ObservadorQos::Rx, &obsQos));
+
+  // Socket para el Servidor EDGE (Puerto 5001)
+  Ptr<Socket> edgeSink = Socket::CreateSocket(edgeServer, UdpSocketFactory::GetTypeId());
+  edgeSink->Bind(InetSocketAddress(Ipv4Address::GetAny(), portEdge));
+  edgeSink->SetRecvCallback(MakeCallback(&ObservadorQos::Rx, &obsQos));
+
+  // 8. EJECUCIÓN
   Simulator::Stop(duracionSim + Seconds(1.0));
   Simulator::Run();
 
-  // Acumular TX totales reales (para PDR “de verdad”)
-  uint64_t txPkts = 0, txBytes = 0;
-  for (auto &a : senders)
-    {
-      txPkts  += a->GetTxPackets();
-      txBytes += a->GetTxBytes();
-    }
-  obsQos.SetTxTotals(txPkts, txBytes);
+  // 9. RECOLECCIÓN DE RESULTADOS FINALES (El "Pegamento")
+  ResultadosEscenario res;
+
+  // Calculamos paquetes enviados totales (Simplificación: todos los coches envían ambos flujos)
+  // En un sistema real, cada aplicación llevaría su propia cuenta de TX
+  uint64_t paquetesTxEstimadosPorFlujo = nVehiculos * (duracionSim.GetSeconds() / periodoEnvio.GetSeconds());
+
+  // Extraemos métricas diferenciadas usando los puertos como clave
+  res.cloud = obsQos.GetStats(portCloud, paquetesTxEstimadosPorFlujo);
+  res.edge  = obsQos.GetStats(portEdge, paquetesTxEstimadosPorFlujo);
+  
+  // Aquí capturaríamos los drops físicos de la cola si tienes configurado el ObservadorCola
+  res.dropsTotales = 0; // Se actualizará en la Fase 2 con el TraceSource de FqCoDel[cite: 4]
+
+  NS_LOG_INFO("Simulación terminada. PDR Cloud: " << res.cloud.pdr << " | PDR Edge: " << res.edge.pdr);
 
   Simulator::Destroy();
-
-  ResultadosEscenario res = obsQos.GetResultados(obsCola.PaquetesPerdidos());
-  NS_LOG_INFO("[Escenario] Backhaul=" << tasaBackhaulMbps << "Mbps | "
-              << "Delay=" << res.delayMedioSeg << "s | "
-              << "Jitter=" << res.jitterMedioSeg << "s | "
-              << "PDR=" << res.pdr << " | "
-              << "Throughput=" << res.throughputMbps << "Mbps | "
-              << "Drops=" << res.paquetesPerdidos);
-
   return res;
+
 }
 
 // ---------------------------
@@ -441,100 +409,53 @@ EjecutarEscenario(double tasaBackhaulMbps,
 // ---------------------------
 int main(int argc, char *argv[])
 {
-  Time::SetResolution(Time::NS);
-
-  // Defaults
-  uint32_t nVehiculos      = 50;
+  // 1. PARÁMETROS POR LÍNEA DE COMANDOS (Ingeniería de Software)
+  uint32_t nVehiculos = 50;
   uint32_t tamPaqueteBytes = 1024;
-  Time periodoEnvio        = Seconds(0.1);
-
-  double tasaMinMbps  = 1.0;
-  double tasaMaxMbps  = 10.0;
+  double tasaMinMbps = 1.0;
+  double tasaMaxMbps = 10.0;
   double tasaPasoMbps = 1.0;
-
-  uint32_t numMuestras = 20;
-
-  Time duracionSim       = Seconds(60.0);
+  uint32_t numMuestras = 20; // Réplicas para validez estadística[cite: 4]
+  Time duracionSim = Seconds(60.0);
   Time tiempoTransitorio = Seconds(2.0);
-  Time backhaulDelay     = MilliSeconds(2);
-
-
 
   CommandLine cmd;
-  cmd.AddValue("nVehiculos", "Numero de vehiculos (fuentes) en cobertura [-]", nVehiculos);
-  cmd.AddValue("tamPaqueteBytes", "Tamano payload de telemetria (bytes)", tamPaqueteBytes);
-  cmd.AddValue("periodoEnvio", "Periodo entre envios (ej: 0.1s)", periodoEnvio);
-
-  cmd.AddValue("tasaMinMbps", "Capacidad minima backhaul (Mb/s)", tasaMinMbps);
-  cmd.AddValue("tasaMaxMbps", "Capacidad maxima backhaul (Mb/s)", tasaMaxMbps);
-  cmd.AddValue("tasaPasoMbps", "Paso capacidades (Mb/s)", tasaPasoMbps);
-
-  cmd.AddValue("numMuestras", "Numero de replicas por punto", numMuestras);
-  cmd.AddValue("duracionSim", "Duracion simulacion (ej: 60s)", duracionSim);
-  cmd.AddValue("tiempoTransitorio", "Transitorio a ignorar (ej: 2s)", tiempoTransitorio);
-  cmd.AddValue("backhaulDelay", "Retardo base del backhaul (ej: 2ms)", backhaulDelay);
-
+  cmd.AddValue("nVehiculos", "Carga de tráfico (coches)", nVehiculos);
+  cmd.AddValue("tasaMinMbps", "Capacidad mínima Backhaul", tasaMinMbps);
+  cmd.AddValue("numMuestras", "Réplicas por punto (PSR)", numMuestras);
   cmd.Parse(argc, argv);
 
-  NS_LOG_INFO("=== CONFIGURACION ===");
-  NS_LOG_INFO("Vehiculos: " << nVehiculos << " | Payload: " << tamPaqueteBytes << " bytes");
-  NS_LOG_INFO("Periodo envio: " << periodoEnvio.As(Time::MS) << " | Duracion: " << duracionSim.As(Time::S));
-  NS_LOG_INFO("Backhaul: [" << tasaMinMbps << "-" << tasaMaxMbps << "] Mbps, paso " << tasaPasoMbps);
-  NS_LOG_INFO("Muestras por punto: " << numMuestras);
-  NS_LOG_INFO("====================");
-
-  // Capacidades
-  std::vector<double> capacidades;
-  for (double c = tasaMinMbps; c <= tasaMaxMbps + 1e-9; c += tasaPasoMbps)
-    capacidades.push_back(c);
-
-  // .plt
-  Grafica gD("retardo.plt", "Retardo medio vs capacidad backhaul", "Capacidad (Mb/s)", "Retardo (s)");
-  Grafica gJ("jitter.plt", "Jitter medio vs capacidad backhaul", "Capacidad (Mb/s)", "Jitter (s)");
-  Grafica gP("pdr.plt", "PDR vs capacidad backhaul", "Capacidad (Mb/s)", "PDR");
-  Grafica gT("throughput.plt", "Throughput vs capacidad backhaul", "Capacidad (Mb/s)", "Throughput (Mb/s)");
-
-  Curva cD("Retardo");
-  Curva cJ("Jitter");
-  Curva cP("PDR");
-  Curva cT("Throughput");
+  // 2. CONFIGURACIÓN DE GRÁFICAS (Visualización Analítica)
+  Grafica gD("retardo_comparativo.plt", "Retardo Medio: Cloud vs Edge", "Capacidad Backhaul (Mbps)", "Retardo (s)");
+  Curva cCloud("Retardo Cloud (P5000)");
+  Curva cEdge("Retardo Edge (P5001)");
 
   uint32_t runId = 1;
 
-  for (double cap : capacidades)
-    {
-      NS_LOG_INFO("\n>>> Barriendo capacidad: " << cap << " Mbps");
-
-      Punto pD, pJt, pPdr, pTh;
+  // 3. BUCLE DE EXPERIMENTACIÓN (Estudio Paramétrico)[cite: 3]
+  for (double cap = tasaMinMbps; cap <= tasaMaxMbps; cap += tasaPasoMbps)
+  {
+      NS_LOG_UNCOND(">>> Analizando capacidad Cloud: " << cap << " Mbps");
+      Punto pCloud, pEdge; // Acumuladores estadísticos[cite: 4]
 
       for (uint32_t m = 0; m < numMuestras; ++m)
-        {
-          NS_LOG_INFO("  Muestra " << (m+1) << "/" << numMuestras << "...");
-          ResultadosEscenario r = EjecutarEscenario(
-            cap, nVehiculos, tamPaqueteBytes, periodoEnvio,
-            duracionSim, tiempoTransitorio, backhaulDelay, runId);
+      {
+          ResultadosEscenario r = EjecutarEscenario(cap, nVehiculos, tamPaqueteBytes, 
+                                                   Seconds(0.1), duracionSim, 
+                                                   tiempoTransitorio, runId++);
+          
+          pCloud.Update(r.cloud.delayMedio);
+          pEdge.Update(r.edge.delayMedio);
+      }
 
-          pD.Update(r.delayMedioSeg);
-          pJt.Update(r.jitterMedioSeg);
-          pPdr.Update(r.pdr);
-          pTh.Update(r.throughputMbps);
+      // Añadimos puntos con Intervalo de Confianza[cite: 4]
+      cCloud.Add(cap, pCloud);
+      cEdge.Add(cap, pEdge);
+  }
 
-          runId++;
-        }
+  gD.Add(cCloud);
+  gD.Add(cEdge);
 
-      cD.Add(cap, pD);
-      cJ.Add(cap, pJt);
-      cP.Add(cap, pPdr);
-      cT.Add(cap, pTh);
-    }
-
-  gD.Add(cD);
-  gJ.Add(cJ);
-  gP.Add(cP);
-  gT.Add(cT);
-
-  NS_LOG_INFO("\n=== SIMULACION COMPLETADA ===");
-  NS_LOG_INFO("Archivos generados: retardo.plt, jitter.plt, pdr.plt, throughput.plt");
-
+  NS_LOG_UNCOND("Fase 1 Completada. Archivo 'retardo_comparativo.plt' generado.");
   return 0;
 }
