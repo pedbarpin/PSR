@@ -147,32 +147,49 @@ static ResultadosEscenario EjecutarEscenario(double backMbps, uint32_t queueLimi
     NodeContainer cars; cars.Create(nVeh);
     
     InternetStackHelper stack;
-    NodeContainer allNodes (cars, rsu, edgeSrv, cloudSrv);
+    NodeContainer allNodes(cars, rsu, edgeSrv, cloudSrv);
     stack.Install(allNodes);
 
-    CsmaHelper csma; csma.SetChannelAttribute("DataRate", StringValue("1Gbps"));
-    NetDeviceContainer edgeDevs = csma.Install(NodeContainer(rsu, edgeSrv));
+    // --- 1. TOPOLOGÍA FÍSICA CORREGIDA ---
+    // Red de Acceso (V2R): Todos los coches + RSU en el mismo medio CSMA
+    CsmaHelper v2r; 
+    v2r.SetChannelAttribute("DataRate", StringValue("100Mbps"));
+    NodeContainer accessNodes(cars);
+    accessNodes.Add(rsu);
+    NetDeviceContainer accessDevs = v2r.Install(accessNodes);
 
+    // Red Local Edge: RSU + Edge Server
+    CsmaHelper edgeCsma; 
+    edgeCsma.SetChannelAttribute("DataRate", StringValue("1Gbps"));
+    NetDeviceContainer edgeDevs = edgeCsma.Install(NodeContainer(rsu, edgeSrv));
+
+    // Red Larga Distancia Cloud: RSU + Cloud Server (Cuello de Botella)
     PointToPointHelper ppp; 
     ppp.SetDeviceAttribute("DataRate", StringValue(std::to_string(backMbps) + "Mbps"));
     NetDeviceContainer cloudDevs = ppp.Install(NodeContainer(rsu, cloudSrv));
 
+    // --- 2. GESTIÓN DE COLAS (FqCoDel) ---
     uint32_t dropsEnEstaEjecucion = 0;
-
-    // --- CORRECCIÓN NS-3.45: FqCoDel ---
     TrafficControlHelper tch;
-    std::string maxSizeStr = std::to_string(queueLimit) + "p"; // Ej: "100p"
+    std::string maxSizeStr = std::to_string(queueLimit) + "p"; 
     tch.SetRootQueueDisc("ns3::FqCoDelQueueDisc", "MaxSize", StringValue(maxSizeStr));
     QueueDiscContainer qdCont = tch.Install(cloudDevs.Get(0));
     qdCont.Get(0)->TraceConnectWithoutContext("Drop", MakeBoundCallback(&PacketDropCallback, &dropsEnEstaEjecucion));
-    
-    CsmaHelper v2r; v2r.SetChannelAttribute("DataRate", StringValue("100Mbps"));
 
+    // --- 3. DIRECCIONAMIENTO IP (La clave para que haya tráfico) ---
     Ipv4AddressHelper addr;
-    addr.SetBase("10.1.1.0", "255.255.255.0"); Ipv4InterfaceContainer edgeIfs = addr.Assign(edgeDevs);
-    addr.SetBase("10.1.2.0", "255.255.255.0"); Ipv4InterfaceContainer cloudIfs = addr.Assign(cloudDevs);
+    addr.SetBase("10.1.1.0", "255.255.255.0"); 
+    Ipv4InterfaceContainer accessIfs = addr.Assign(accessDevs); // ¡IPs para los coches!
+
+    addr.SetBase("10.1.2.0", "255.255.255.0"); 
+    Ipv4InterfaceContainer edgeIfs = addr.Assign(edgeDevs);
+
+    addr.SetBase("10.1.3.0", "255.255.255.0"); 
+    Ipv4InterfaceContainer cloudIfs = addr.Assign(cloudDevs);
+
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 
+    // --- 4. CONFIGURACIÓN DE APLICACIONES (El Bucle) ---
     Ptr<UniformRandomVariable> u = CreateObject<UniformRandomVariable>();
     uint16_t pCloud = 5000, pEdgeBurst = 5001, pEdgeTelem = 5002;
     ObservadorQos obs(tTrans);
@@ -181,9 +198,9 @@ static ResultadosEscenario EjecutarEscenario(double backMbps, uint32_t queueLimi
     std::vector<Ptr<TelemSender>> sendersEdge;
 
     for (uint32_t i = 0; i < nVeh; ++i) {
-        v2r.Install(NodeContainer(cars.Get(i), rsu));
         Ptr<TelemSender> s = CreateObject<TelemSender>();
         
+        // Enrutamiento MEC: ¿Al Cloud o al Edge?
         if (i < nVeh * splitRatio) {
             s->Setup(edgeIfs.GetAddress(1), pEdgeTelem, pkSize, period);
             sendersEdge.push_back(s);
@@ -196,6 +213,7 @@ static ResultadosEscenario EjecutarEscenario(double backMbps, uint32_t queueLimi
         s->SetStartTime(Seconds(u->GetValue(0, 0.1))); 
         s->SetStopTime(totalT);
 
+        // Ráfagas siempre al Edge
         OnOffHelper burst("ns3::UdpSocketFactory", InetSocketAddress(edgeIfs.GetAddress(1), pEdgeBurst));
         burst.SetAttribute("DataRate", StringValue("2Mbps"));
         
@@ -210,9 +228,10 @@ static ResultadosEscenario EjecutarEscenario(double backMbps, uint32_t queueLimi
         burst.SetAttribute("OffTime", PointerValue(offTime));
         
         ApplicationContainer bApp = burst.Install(cars.Get(i));
-        bApp.Start(Seconds(u->GetValue(2.0, 3.0))); bApp.Stop(totalT);
+        bApp.Start(Seconds(u->GetValue(2.0, 3.0))); 
+        bApp.Stop(totalT);
     }
-
+    
     Ptr<Socket> sCloud = Socket::CreateSocket(cloudSrv, UdpSocketFactory::GetTypeId());
     sCloud->Bind(InetSocketAddress(Ipv4Address::GetAny(), pCloud));
     sCloud->SetRecvCallback(MakeCallback(&ObservadorQos::Rx, &obs));
@@ -239,6 +258,7 @@ static ResultadosEscenario EjecutarEscenario(double backMbps, uint32_t queueLimi
 }
 
 // --- 6. MAIN (ESTUDIO PARAMÉTRICO: SPLIT RATIO MEC COMPLETO) ---
+// --- 6. MAIN (ESTUDIO PARAMÉTRICO: SPLIT RATIO MULTI-CURVA) ---
 int main(int argc, char *argv[]) {
     uint32_t nMuestras = 3; 
     CommandLine cmd; 
@@ -246,49 +266,73 @@ int main(int argc, char *argv[]) {
     cmd.Parse(argc, argv);
 
     double backhaulCongestionado = 3.0; // 3 Mbps fijos para causar saturación
-    uint32_t queueLimitFijo = 100;      // 100 paquetes de limite de cola
+    uint32_t queueLimitFijo = 100;      // 100 paquetes límite
 
     std::vector<double> ratios = {0.0, 0.2, 0.4, 0.6, 0.8, 1.0};
 
-    // 1. TRES gráficas
-    Grafica gDelay("retardo_split.plt", "Efecto MEC: Retardo vs Split Ratio", "Porcentaje de Trafico al Edge (%)", "Retardo Medio Cloud (s)");
-    Grafica gPdr("pdr_split.plt", "Efecto MEC: PDR vs Split Ratio", "Porcentaje de Trafico al Edge (%)", "PDR Cloud (%)");
+    // TRES gráficas
+    Grafica gDelay("retardo_split.plt", "Efecto MEC: Retardo vs Split Ratio", "Porcentaje de Trafico al Edge (%)", "Retardo Medio (s)");
+    Grafica gPdr("pdr_split.plt", "Efecto MEC: PDR vs Split Ratio", "Porcentaje de Trafico al Edge (%)", "PDR (%)");
     Grafica gThput("throughput_split.plt", "Distribucion de Carga: Throughput vs Split Ratio", "Porcentaje de Trafico al Edge (%)", "Throughput (Mbps)");
 
-    Curva cDelay("Retardo Cloud");
-    Curva cPdr("PDR Cloud");
+    // ¡DOS curvas por gráfica para comparar!
+    Curva cDelayCloud("Retardo Cloud (Cuello de Botella)");
+    Curva cDelayEdge("Retardo Edge (Local)");
+    
+    Curva cPdrCloud("PDR Cloud");
+    Curva cPdrEdge("PDR Edge");
+    
     Curva cThputCloud("Caudal Cloud");
     Curva cThputEdge("Caudal Edge");
 
     NS_LOG_UNCOND("Iniciando Estudio Completo de Split Ratio (MEC)...");
 
     for (double ratio : ratios) {
-        Punto pDelay, pPdr, pThputCloud, pThputEdge;
+        Punto pDelayCloud, pDelayEdge, pPdrCloud, pPdrEdge, pThputCloud, pThputEdge;
         NS_LOG_UNCOND(">>> Evaluando Split Ratio: " << (ratio * 100) << "% al Edge");
         
         for (uint32_t m = 0; m < nMuestras; ++m) {
             ResultadosEscenario r = EjecutarEscenario(backhaulCongestionado, queueLimitFijo, ratio, 50, 1024, Seconds(0.1), Seconds(20), Seconds(2), m + 1);
             
+            // Llenamos Puntos del Cloud
             if (ratio < 1.0) {
-                pDelay.Update(r.cloud.delayMedio);
-                pPdr.Update(r.cloud.pdr * 100.0);
+                pDelayCloud.Update(r.cloud.delayMedio);
+                pPdrCloud.Update(r.cloud.pdr * 100.0);
             } else {
-                pDelay.Update(0.0); 
-                pPdr.Update(100.0);
+                pDelayCloud.Update(0.0); 
+                pPdrCloud.Update(100.0);
             }
-            
             pThputCloud.Update(r.cloud.throughput);
+
+            // Llenamos Puntos del Edge
+            if (ratio > 0.0) {
+                pDelayEdge.Update(r.edge.delayMedio);
+                pPdrEdge.Update(r.edge.pdr * 100.0);
+            } else {
+                pDelayEdge.Update(0.0);
+                pPdrEdge.Update(100.0);
+            }
             pThputEdge.Update(r.edge.throughput);
         }
         
-        cDelay.Add(ratio * 100.0, pDelay);
-        cPdr.Add(ratio * 100.0, pPdr);
+        // Añadimos puntos a curvas
+        cDelayCloud.Add(ratio * 100.0, pDelayCloud);
+        cDelayEdge.Add(ratio * 100.0, pDelayEdge);
+        
+        cPdrCloud.Add(ratio * 100.0, pPdrCloud);
+        cPdrEdge.Add(ratio * 100.0, pPdrEdge);
+        
         cThputCloud.Add(ratio * 100.0, pThputCloud);
         cThputEdge.Add(ratio * 100.0, pThputEdge);
     }
 
-    gDelay.Add(cDelay);
-    gPdr.Add(cPdr);
+    // Inyectamos las múltiples curvas en sus gráficas
+    gDelay.Add(cDelayCloud);
+    gDelay.Add(cDelayEdge);
+    
+    gPdr.Add(cPdrCloud);
+    gPdr.Add(cPdrEdge);
+    
     gThput.Add(cThputCloud);
     gThput.Add(cThputEdge); 
 
