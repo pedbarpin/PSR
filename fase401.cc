@@ -14,7 +14,7 @@
 #include "ns3/traffic-control-module.h"
 #include "ns3/random-variable-stream.h"
 
-#include "punto.h" // Asegúrate de que este archivo existe en la misma carpeta
+#include "punto.h" // Asegurate de que este archivo existe en la misma carpeta
 
 using namespace ns3;
 
@@ -66,35 +66,33 @@ public:
     explicit ObservadorQos(Time tInicio) : m_tInicio(tInicio) {}
 
     void Rx(Ptr<Socket> sock) {
-    Ptr<Packet> p;
-    Address from;
-    while ((p = sock->RecvFrom(from))) {
-        if (Simulator::Now() < m_tInicio) continue;
+        Ptr<Packet> p;
+        Address from;
+        while ((p = sock->RecvFrom(from))) {
+            if (Simulator::Now() < m_tInicio) continue;
 
-        AppSeqTsHeader h;
-        if (p->GetSize() < h.GetSerializedSize()) continue;
-        p->RemoveHeader(h);
+            AppSeqTsHeader h;
+            if (p->GetSize() < h.GetSerializedSize()) continue;
+            p->RemoveHeader(h);
 
-        // --- SOLUCIÓN AL ERROR ---
-        Address addr;
-        sock->GetSockName(addr); // Obtenemos la dirección del socket local
-        InetSocketAddress localAddr = InetSocketAddress::ConvertFrom(addr);
-        uint16_t port = localAddr.GetPort(); // Extraemos el puerto (5000 o 5001)
+            Address addr;
+            sock->GetSockName(addr);
+            InetSocketAddress localAddr = InetSocketAddress::ConvertFrom(addr);
+            uint16_t port = localAddr.GetPort(); 
 
-        double delay = (Simulator::Now() - h.GetTs()).GetSeconds();
-        Metrics &m = m_flowStats[port]; // Ahora 'port' sí está declarado
-        // -------------------------
+            double delay = (Simulator::Now() - h.GetTs()).GetSeconds();
+            Metrics &m = m_flowStats[port]; 
 
-        m.rxPkts++; 
-        m.rxBytes += p->GetSize(); 
-        m.sumDelay += delay;
-        if (m.hasLastDelay) m.sumJitter += std::fabs(delay - m.lastDelay);
-        m.lastDelay = delay; 
-        m.hasLastDelay = true;
-        if (!m.hasFirst) { m.hasFirst = true; m.firstRx = Simulator::Now(); }
-        m.lastRx = Simulator::Now();
+            m.rxPkts++; 
+            m.rxBytes += p->GetSize(); 
+            m.sumDelay += delay;
+            if (m.hasLastDelay) m.sumJitter += std::fabs(delay - m.lastDelay);
+            m.lastDelay = delay; 
+            m.hasLastDelay = true;
+            if (!m.hasFirst) { m.hasFirst = true; m.firstRx = Simulator::Now(); }
+            m.lastRx = Simulator::Now();
+        }
     }
-}
 
     ResultadosFlujo GetStats(uint16_t port, uint64_t txPkts) {
         ResultadosFlujo res;
@@ -137,21 +135,20 @@ private:
     Time m_period; uint32_t m_seq; uint64_t m_txPkts; EventId m_sendEv;
 };
 
-
-// --- OBSERVADOR DE DESCARTES 
+// --- OBSERVADOR DE DESCARTES ---
 static void PacketDropCallback(uint32_t *contadorDrops, Ptr<const QueueDiscItem> item) {
     (*contadorDrops)++;
 }
 
-// --- 5. LÓGICA DE ESCENARIO (Cierre Fase 1.3) ---
+// --- 5. LÓGICA DE ESCENARIO ---
 static ResultadosEscenario EjecutarEscenario(double backMbps, uint32_t queueLimit, double splitRatio, uint32_t nVeh, uint32_t pkSize, Time period, Time totalT, Time tTrans, uint32_t runId) {
     RngSeedManager::SetRun(runId);
     Ptr<Node> rsu = CreateObject<Node>(), edgeSrv = CreateObject<Node>(), cloudSrv = CreateObject<Node>();
     NodeContainer cars; cars.Create(nVeh);
     
     InternetStackHelper stack;
-	  NodeContainer allNodes (cars, rsu, edgeSrv, cloudSrv);
-	  stack.Install(allNodes);
+    NodeContainer allNodes (cars, rsu, edgeSrv, cloudSrv);
+    stack.Install(allNodes);
 
     CsmaHelper csma; csma.SetChannelAttribute("DataRate", StringValue("1Gbps"));
     NetDeviceContainer edgeDevs = csma.Install(NodeContainer(rsu, edgeSrv));
@@ -160,18 +157,13 @@ static ResultadosEscenario EjecutarEscenario(double backMbps, uint32_t queueLimi
     ppp.SetDeviceAttribute("DataRate", StringValue(std::to_string(backMbps) + "Mbps"));
     NetDeviceContainer cloudDevs = ppp.Install(NodeContainer(rsu, cloudSrv));
 
-   // Variable local para contar los descartes de esta ejecución
     uint32_t dropsEnEstaEjecucion = 0;
 
-    // --- GESTIÓN DE COLAS: FqCoDel (Teletráfico) ---
+    // --- CORRECCIÓN NS-3.45: FqCoDel ---
     TrafficControlHelper tch;
-    // Configuramos FqCoDel y limitamos su capacidad según el parámetro queueLimit
-    tch.SetRootQueueDisc("ns3::FqCoDelQueueDisc", "PacketLimit", UintegerValue(queueLimit));
-    
-    // Instalamos la cola SOLO en el nodo 0 del enlace Cloud (la interfaz de salida de la RSU)
+    std::string maxSizeStr = std::to_string(queueLimit) + "p"; // Ej: "100p"
+    tch.SetRootQueueDisc("ns3::FqCoDelQueueDisc", "MaxSize", StringValue(maxSizeStr));
     QueueDiscContainer qdCont = tch.Install(cloudDevs.Get(0));
-
-    // Conectamos nuestro observador (Sniffer) a la traza "Drop" usando un BoundCallback
     qdCont.Get(0)->TraceConnectWithoutContext("Drop", MakeBoundCallback(&PacketDropCallback, &dropsEnEstaEjecucion));
     
     CsmaHelper v2r; v2r.SetChannelAttribute("DataRate", StringValue("100Mbps"));
@@ -192,8 +184,6 @@ static ResultadosEscenario EjecutarEscenario(double backMbps, uint32_t queueLimi
         v2r.Install(NodeContainer(cars.Get(i), rsu));
         Ptr<TelemSender> s = CreateObject<TelemSender>();
         
-        // --- LÓGICA DE ENRUTAMIENTO EDGE vs CLOUD ---
-        // Si el coche entra en el porcentaje de splitRatio, envía al Edge. Si no, al Cloud.
         if (i < nVeh * splitRatio) {
             s->Setup(edgeIfs.GetAddress(1), pEdgeTelem, pkSize, period);
             sendersEdge.push_back(s);
@@ -206,7 +196,6 @@ static ResultadosEscenario EjecutarEscenario(double backMbps, uint32_t queueLimi
         s->SetStartTime(Seconds(u->GetValue(0, 0.1))); 
         s->SetStopTime(totalT);
 
-        // Las ráfagas SIEMPRE van al Edge (Puerto 5001)
         OnOffHelper burst("ns3::UdpSocketFactory", InetSocketAddress(edgeIfs.GetAddress(1), pEdgeBurst));
         burst.SetAttribute("DataRate", StringValue("2Mbps"));
         
@@ -221,11 +210,9 @@ static ResultadosEscenario EjecutarEscenario(double backMbps, uint32_t queueLimi
         burst.SetAttribute("OffTime", PointerValue(offTime));
         
         ApplicationContainer bApp = burst.Install(cars.Get(i));
-        bApp.Start(Seconds(u->GetValue(2.0, 3.0))); 
-        bApp.Stop(totalT);
+        bApp.Start(Seconds(u->GetValue(2.0, 3.0))); bApp.Stop(totalT);
     }
 
-    // --- SOCKETS RECEPTORES ---
     Ptr<Socket> sCloud = Socket::CreateSocket(cloudSrv, UdpSocketFactory::GetTypeId());
     sCloud->Bind(InetSocketAddress(Ipv4Address::GetAny(), pCloud));
     sCloud->SetRecvCallback(MakeCallback(&ObservadorQos::Rx, &obs));
@@ -238,63 +225,73 @@ static ResultadosEscenario EjecutarEscenario(double backMbps, uint32_t queueLimi
     sEdgeTelem->Bind(InetSocketAddress(Ipv4Address::GetAny(), pEdgeTelem));
     sEdgeTelem->SetRecvCallback(MakeCallback(&ObservadorQos::Rx, &obs));
 
-    Simulator::Stop(totalT + Seconds(1)); 
-    Simulator::Run();
+    Simulator::Stop(totalT + Seconds(1)); Simulator::Run();
 
-    // Contabilizamos paquetes enviados para el PDR
     uint64_t txCloud = 0; for(auto &s : sendersCloud) txCloud += s->GetTxPkts();
     uint64_t txEdgeTelem = 0; for(auto &s : sendersEdge) txEdgeTelem += s->GetTxPkts();
     
-    // (Omitimos el cálculo teórico de ráfagas para no ensuciar, nos centramos en telemetría)
     ResultadosEscenario res;
     res.cloud = obs.GetStats(pCloud, txCloud);
-    // Para simplificar la salida, guardamos la métrica de telemetría del Edge
     res.edge = obs.GetStats(pEdgeTelem, txEdgeTelem); 
     res.dropsTotales = dropsEnEstaEjecucion;
     Simulator::Destroy();
     return res;
 }
 
-
-// --- 6. MAIN (ESTUDIO PARAMÉTRICO: SPLIT RATIO MEC) ---
+// --- 6. MAIN (ESTUDIO PARAMÉTRICO: SPLIT RATIO MEC COMPLETO) ---
 int main(int argc, char *argv[]) {
     uint32_t nMuestras = 3; 
     CommandLine cmd; 
-    cmd.AddValue("numMuestras", "Réplicas estadísticas", nMuestras); 
+    cmd.AddValue("numMuestras", "Replicas estadisticas", nMuestras); 
     cmd.Parse(argc, argv);
 
-    // Condiciones fijas para forzar el cuello de botella
-    double backhaulCongestionado = 3.0; // 3 Mbps
-    uint32_t queueLimitFijo = 100;      // 100 paquetes de buffer
+    double backhaulCongestionado = 3.0; // 3 Mbps fijos para causar saturación
+    uint32_t queueLimitFijo = 100;      // 100 paquetes de limite de cola
 
-    // Barrido del 0% al 100% hacia el Edge
     std::vector<double> ratios = {0.0, 0.2, 0.4, 0.6, 0.8, 1.0};
 
-    Grafica gDelay("retardo_split.plt", "Efecto del Edge Computing: Retardo vs Split Ratio", "Porcentaje de Trafico al Edge (%)", "Retardo Medio Cloud (s)");
-    Curva cDelay("Retardo Cloud");
+    // 1. TRES gráficas
+    Grafica gDelay("retardo_split.plt", "Efecto MEC: Retardo vs Split Ratio", "Porcentaje de Trafico al Edge (%)", "Retardo Medio Cloud (s)");
+    Grafica gPdr("pdr_split.plt", "Efecto MEC: PDR vs Split Ratio", "Porcentaje de Trafico al Edge (%)", "PDR Cloud (%)");
+    Grafica gThput("throughput_split.plt", "Distribucion de Carga: Throughput vs Split Ratio", "Porcentaje de Trafico al Edge (%)", "Throughput (Mbps)");
 
-    NS_LOG_UNCOND("Iniciando Estudio de Split Ratio (MEC)...");
+    Curva cDelay("Retardo Cloud");
+    Curva cPdr("PDR Cloud");
+    Curva cThputCloud("Caudal Cloud");
+    Curva cThputEdge("Caudal Edge");
+
+    NS_LOG_UNCOND("Iniciando Estudio Completo de Split Ratio (MEC)...");
 
     for (double ratio : ratios) {
-        Punto pDelay;
+        Punto pDelay, pPdr, pThputCloud, pThputEdge;
         NS_LOG_UNCOND(">>> Evaluando Split Ratio: " << (ratio * 100) << "% al Edge");
         
         for (uint32_t m = 0; m < nMuestras; ++m) {
             ResultadosEscenario r = EjecutarEscenario(backhaulCongestionado, queueLimitFijo, ratio, 50, 1024, Seconds(0.1), Seconds(20), Seconds(2), m + 1);
             
-            // Si no hay paquetes al Cloud (ratio 1.0), evitamos guardar ceros falsos en el retardo
             if (ratio < 1.0) {
                 pDelay.Update(r.cloud.delayMedio);
+                pPdr.Update(r.cloud.pdr * 100.0);
             } else {
-                pDelay.Update(0.0); // Retardo 0 si no hay tráfico
+                pDelay.Update(0.0); 
+                pPdr.Update(100.0);
             }
+            
+            pThputCloud.Update(r.cloud.throughput);
+            pThputEdge.Update(r.edge.throughput);
         }
         
         cDelay.Add(ratio * 100.0, pDelay);
+        cPdr.Add(ratio * 100.0, pPdr);
+        cThputCloud.Add(ratio * 100.0, pThputCloud);
+        cThputEdge.Add(ratio * 100.0, pThputEdge);
     }
 
     gDelay.Add(cDelay);
-    NS_LOG_UNCOND("Simulacion terminada. Grafica retardo_split.plt generada.");
-    
+    gPdr.Add(cPdr);
+    gThput.Add(cThputCloud);
+    gThput.Add(cThputEdge); 
+
+    NS_LOG_UNCOND("Simulacion terminada. Revisa los archivos .plt");
     return 0;
 }
